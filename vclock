@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+# vclock — вертикальные часы стопкой (HH / MM / SS) в стиле tty-clock.
+# Цифры — сплошные блоки (█) подлинным 3x5 шрифтом tty-clock, между ними двоеточие.
+# Под датой опционально (узкими строками, не шире цифр): нагрузка+температура CPU/GPU,
+# загрузка по ядрам спарклайном, мощность SoC, скорость выбранного сетевого интерфейса.
+# Источники sudoless: macmon (cpu/gpu/temp/power), host_processor_info (ядра), netstat (сеть).
+#
+# Использование: vclock [часы] [метрики]
+#   Часы:
+#     -c ЦВЕТ : цвет ANSI-256 (по умолч. 51 = cyan)
+#     -s      : без секунд
+#     --12    : 12-часовой формат
+#     -b      : мигающее двоеточие
+#     -d      : дата dd-mm-yyyy
+#     -n      : без центрирования узких цифр (как tty-clock)
+#   Метрики (стопкой под датой, обновление раз в 5 сек):
+#     --cpu            : загрузка CPU %     (+ °C, если задан --temp)
+#     --gpu            : загрузка GPU %     (+ °C, если задан --temp)
+#     --temp           : температуры CPU/GPU (добавляется к строкам выше)
+#     --cores          : загрузка по каждому ядру спарклайном ▁▂▃▄▅▆▇█
+#     --power          : мощность SoC, Вт
+#     --net [ИФЕЙС]    : скорость сети ↓/↑ по интерфейсу (по умолч. дефолтный маршрут).
+#                        напр. --net utun4 — трафик через VPN/туннель.
+# Метрики CPU/GPU/temp/power требуют macmon:  brew install macmon
+# Выход: Ctrl+C
+import sys, os, time, json, signal, shutil, argparse, re, subprocess, threading, ctypes
+from datetime import datetime
+
+FONT = {
+    '0': (1,1,1, 1,0,1, 1,0,1, 1,0,1, 1,1,1),
+    '1': (0,0,1, 0,0,1, 0,0,1, 0,0,1, 0,0,1),
+    '2': (1,1,1, 0,0,1, 1,1,1, 1,0,0, 1,1,1),
+    '3': (1,1,1, 0,0,1, 1,1,1, 0,0,1, 1,1,1),
+    '4': (1,0,1, 1,0,1, 1,1,1, 0,0,1, 0,0,1),
+    '5': (1,1,1, 1,0,0, 1,1,1, 0,0,1, 1,1,1),
+    '6': (1,1,1, 1,0,0, 1,1,1, 1,0,1, 1,1,1),
+    '7': (1,1,1, 0,0,1, 0,0,1, 0,0,1, 0,0,1),
+    '8': (1,1,1, 1,0,1, 1,1,1, 1,0,1, 1,1,1),
+    '9': (1,1,1, 1,0,1, 1,1,1, 0,0,1, 1,1,1),
+}
+ON, OFF = '██', '  '
+GAP = '  '
+WIDTH = 14
+POLL = 5                      # период опроса метрик, сек
+BARS = "▁▂▃▄▅▆▇█"
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+vlen = lambda s: len(ANSI.sub("", s))
+
+def color_wrap(s, color, dim=False):
+    pre = "\033[2;" if dim else "\033["
+    return f"{pre}38;5;{color}m{s}\033[0m"
+
+# ---------- цифры ----------
+def render_pair_raw(s):
+    rows = []
+    for r in range(5):
+        cells = [''.join(ON if FONT[ch][r*3+c] else OFF for c in range(3)) for ch in s]
+        rows.append(GAP.join(cells))
+    return rows
+
+def center_ink(rows, width=WIDTH):
+    cols = len(rows[0])
+    has = lambda i: any(r[i] != ' ' for r in rows)
+    left = next((i for i in range(cols) if has(i)), 0)
+    right = next((i for i in range(cols - 1, -1, -1) if has(i)), cols - 1) + 1
+    pad = max((width - (right - left)) // 2, 0)
+    return [(' ' * pad + r[left:right] + ' ' * width)[:width] for r in rows]
+
+def render_pair(s, color, center=True):
+    rows = render_pair_raw(s)
+    if center:
+        rows = center_ink(rows)
+    return [color_wrap(l, color) for l in rows]
+
+def colon_rows(color, visible):
+    if not visible:
+        return ["", "", ""]
+    dot = ("██" + " " * 4 + "██").center(WIDTH)
+    return ["", color_wrap(dot, color), ""]
+
+# ---------- загрузка по ядрам (host_processor_info, sudoless) ----------
+class CoreSampler:
+    def __init__(self):
+        self.ok = False
+        try:
+            self.libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+            self.libc.mach_host_self.restype = ctypes.c_uint
+            self.libc.mach_task_self.restype = ctypes.c_uint
+            self.libc.host_processor_info.restype = ctypes.c_int
+            self.libc.host_processor_info.argtypes = [
+                ctypes.c_uint, ctypes.c_int, ctypes.POINTER(ctypes.c_uint),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_uint)), ctypes.POINTER(ctypes.c_uint)]
+            self.prev = None
+            self.ok = True
+        except Exception:
+            pass
+
+    def _raw(self):
+        host = self.libc.mach_host_self()
+        ncpu = ctypes.c_uint(0)
+        info = ctypes.POINTER(ctypes.c_uint)()
+        cnt = ctypes.c_uint(0)
+        if self.libc.host_processor_info(host, 2, ctypes.byref(ncpu),
+                                         ctypes.byref(info), ctypes.byref(cnt)) != 0:
+            return None
+        n = ncpu.value
+        data = [info[i] for i in range(n * 4)]
+        self.libc.vm_deallocate(self.libc.mach_task_self(),
+                                ctypes.cast(info, ctypes.c_void_p), cnt.value * 4)
+        return n, data
+
+    def usage(self):
+        """Список загрузок 0..1 по ядрам за интервал между вызовами (или None)."""
+        if not self.ok:
+            return None
+        cur = self._raw()
+        if cur is None:
+            return None
+        n, data = cur
+        if self.prev is None or self.prev[0] != n:
+            self.prev = cur
+            return None
+        loads = []
+        for c in range(n):
+            u0, s0, i0, ni0 = self.prev[1][c*4:c*4+4]
+            u1, s1, i1, ni1 = data[c*4:c*4+4]
+            busy = (u1 + s1 + ni1) - (u0 + s0 + ni0)
+            tot = busy + (i1 - i0)
+            loads.append(busy / tot if tot > 0 else 0.0)
+        self.prev = cur
+        return loads
+
+def spark(loads):
+    return "".join(BARS[min(7, max(0, int(x * 8)))] for x in loads)
+
+# ---------- сбор метрик ----------
+class Metrics:
+    def __init__(self, ifaces=None, want_cores=False):
+        self.ifaces = ifaces or []          # список интерфейсов по порядку
+        self.macmon = {}
+        self.net = {}                        # iface -> (down_bps, up_bps)
+        self.cores = None
+        self.proc = None
+        self._cs = CoreSampler() if want_cores else None
+        self._prev_net = {}                  # iface -> (t, ibytes, obytes)
+        self._lock = threading.Lock()
+
+    def start_macmon(self):
+        try:
+            self.proc = subprocess.Popen(
+                ["macmon", "pipe", "-i", str(POLL * 1000)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError:
+            return False
+        threading.Thread(target=self._read_macmon, daemon=True).start()
+        return True
+
+    def _read_macmon(self):
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            with self._lock:
+                self.macmon = d
+
+    def start_slow(self):
+        threading.Thread(target=self._slow, daemon=True).start()
+
+    def _slow(self):
+        if self._cs:
+            self._cs.usage()                      # прайм
+        if self.ifaces:
+            self._sample_net()                    # прайм счётчиков
+        while True:
+            time.sleep(POLL)
+            if self._cs:
+                u = self._cs.usage()
+                if u is not None:
+                    with self._lock:
+                        self.cores = u
+            if self.ifaces:
+                self._sample_net()
+
+    def _sample_net(self):
+        all_b = self._netstat_all()
+        t = time.monotonic()
+        for ifc in self.ifaces:
+            cur = all_b.get(ifc)
+            if cur is None:
+                continue
+            prev = self._prev_net.get(ifc)
+            if prev:
+                dt = t - prev[0]
+                if dt > 0:
+                    with self._lock:
+                        self.net[ifc] = ((cur[0] - prev[1]) / dt,
+                                         (cur[1] - prev[2]) / dt)
+            self._prev_net[ifc] = (t, cur[0], cur[1])
+
+    def _netstat_all(self):
+        """Все <Link>-интерфейсы -> {iface: (ibytes, obytes)} за один вызов netstat."""
+        res = {}
+        try:
+            out = subprocess.check_output(["netstat", "-ib"], text=True)
+        except Exception:
+            return res
+        for line in out.splitlines():
+            f = line.split()
+            # Ibytes/Obytes стабильно отсчитываются справа (работает с MAC и без)
+            if len(f) >= 9 and len(f) > 2 and f[2].startswith("<Link"):
+                try:
+                    res[f[0]] = (int(f[-5]), int(f[-2]))
+                except (ValueError, IndexError):
+                    pass
+        return res
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self.macmon), dict(self.net), self.cores, list(self.ifaces)
+
+    def stop(self):
+        if self.proc:
+            self.proc.terminate()
+
+def default_iface():
+    try:
+        out = subprocess.check_output(["route", "-n", "get", "default"], text=True,
+                                      stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if "interface:" in line:
+                return line.split(":")[1].strip()
+    except Exception:
+        pass
+    return "en0"
+
+def fmt_rate(bps):
+    for unit, div in (("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
+        if bps >= div:
+            return f"{bps/div:.1f} {unit}"
+    return f"{bps:.0f} B/s"
+
+def metric_lines(a, metrics):
+    mac, net, cores, ifaces = metrics.snapshot()
+    out = []
+    wrap = lambda t: color_wrap(t[:WIDTH], a.c, dim=True)
+
+    if a.cpu or a.temp:
+        seg = ["CPU"]
+        if a.cpu:
+            v = mac.get("cpu_usage_pct")
+            seg.append(f"{v*100:.0f}%" if v is not None else "…")
+        if a.temp:
+            t = (mac.get("temp") or {}).get("cpu_temp_avg")
+            seg.append(f"{t:.0f}°C" if t else "…")
+        out.append(wrap(" ".join(seg)))
+    if a.gpu or a.temp:
+        seg = ["GPU"]
+        if a.gpu:
+            g = mac.get("gpu_usage")
+            seg.append(f"{g[1]*100:.0f}%" if g else "…")
+        if a.temp:
+            t = (mac.get("temp") or {}).get("gpu_temp_avg")
+            seg.append(f"{t:.0f}°C" if t else "…")
+        out.append(wrap(" ".join(seg)))
+    if a.cores:
+        out.append(wrap(spark(cores) if cores else "…"))
+    if a.power:
+        p = mac.get("all_power")
+        out.append(wrap(f"{p:.1f} W" if p is not None else "… W"))
+    if a.net is not None:
+        for ifc in ifaces:
+            r = net.get(ifc)
+            out.append(wrap(ifc))
+            out.append(wrap(f"↓ {fmt_rate(r[0])}" if r else "↓ …"))
+            out.append(wrap(f"↑ {fmt_rate(r[1])}" if r else "↑ …"))
+    return out
+
+# ---------- кадр ----------
+def build_frame(a, now, metrics):
+    secs = not a.s
+    parts = [now.strftime("%I" if a.h12 else "%H"), now.strftime("%M")]
+    if secs:
+        parts.append(now.strftime("%S"))
+    bands = [render_pair(p, a.c, center=not a.n) for p in parts]
+
+    blink_on = (not a.b) or (now.second % 2 == 0)
+    out = []
+    for i, b in enumerate(bands):
+        if i:
+            out.extend(colon_rows(a.c, blink_on))
+        out.extend(b)
+    if a.d:
+        out.append("")
+        out.append(color_wrap(now.strftime("%d-%m-%Y"), a.c, dim=True))
+    if metrics is not None:
+        ml = metric_lines(a, metrics)
+        if ml:
+            out.append("")
+            out.extend(ml)
+    return out
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("-c", type=int, default=51, help="цвет ANSI-256")
+    ap.add_argument("-s", action="store_true", help="без секунд")
+    ap.add_argument("--12", dest="h12", action="store_true", help="12-часовой формат")
+    ap.add_argument("-b", action="store_true", help="мигающее двоеточие")
+    ap.add_argument("-d", action="store_true", help="дата dd-mm-yyyy внизу")
+    ap.add_argument("-n", action="store_true", help="без центрирования узких цифр")
+    ap.add_argument("--cpu", action="store_true", help="загрузка CPU %%")
+    ap.add_argument("--gpu", action="store_true", help="загрузка GPU %%")
+    ap.add_argument("--temp", action="store_true", help="температуры CPU/GPU")
+    ap.add_argument("--cores", action="store_true", help="загрузка по ядрам спарклайном")
+    ap.add_argument("--power", action="store_true", help="мощность SoC, Вт")
+    ap.add_argument("--net", nargs="*", default=None, metavar="ИФЕЙС",
+                    help="скорость сети по интерфейсам (можно несколько: --net utun4 ppp0). "
+                         "без значения — дефолтный маршрут")
+    a = ap.parse_args()
+    ifaces = a.net
+    if ifaces == []:                 # --net без аргументов
+        ifaces = [default_iface()]
+
+    need_macmon = a.cpu or a.gpu or a.temp or a.power
+    need_metrics = need_macmon or a.cores or (a.net is not None)
+    metrics = None
+    if need_metrics:
+        metrics = Metrics(ifaces=ifaces, want_cores=a.cores)
+        if need_macmon and not metrics.start_macmon():
+            sys.stderr.write("vclock: для --cpu/--gpu/--temp/--power нужен macmon:\n"
+                             "  brew install macmon\n")
+            sys.exit(1)
+        if a.cores or a.net is not None:
+            metrics.start_slow()
+
+    def restore(*_):
+        if metrics:
+            metrics.stop()
+        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H")
+        sys.stdout.flush()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, restore)
+    signal.signal(signal.SIGTERM, restore)
+
+    sys.stdout.write("\033[?25l\033[2J")
+    while True:
+        cols, lines = shutil.get_terminal_size()
+        body = build_frame(a, datetime.now(), metrics)
+        pad_t = max((lines - len(body)) // 2, 0)
+        buf = ["\033[H", "\n" * pad_t]
+        for l in body:
+            pad_l = max((cols - vlen(l)) // 2, 0)
+            buf.append(" " * pad_l + l + "\033[K\n")
+        buf.append("\033[J")
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        time.sleep(0.2)
+
+if __name__ == "__main__":
+    main()
