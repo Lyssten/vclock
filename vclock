@@ -24,6 +24,7 @@
 # Метрики CPU/GPU/temp/power требуют macmon:  brew install macmon
 # Выход: Ctrl+C
 import sys, os, time, json, signal, shutil, argparse, re, subprocess, threading, ctypes
+import unicodedata
 from datetime import datetime
 
 FONT = {
@@ -45,6 +46,32 @@ POLL = 5                      # период опроса метрик, сек
 BARS = "▁▂▃▄▅▆▇█"
 ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 vlen = lambda s: len(ANSI.sub("", s))
+
+def cell_width(ch):
+    """Ширина одного символа в ячейках обычного terminal emulator."""
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+def clip_ansi(s, width):
+    """Обрезает цветную строку до ширины окна, не разрывая ANSI-последовательности."""
+    if width <= 0:
+        return ""
+    out, used, i = [], 0, 0
+    while i < len(s):
+        if s[i] == "\033":
+            m = ANSI.match(s, i)
+            if m:
+                out.append(m.group())
+                i = m.end()
+                continue
+        w = cell_width(s[i])
+        if used + w > width:
+            break
+        out.append(s[i])
+        used += w
+        i += 1
+    return "".join(out) + "\033[0m"
 
 def color_wrap(s, color, dim=False):
     pre = "\033[2;" if dim else "\033["
@@ -205,7 +232,10 @@ class Metrics:
         """Все <Link>-интерфейсы -> {iface: (ibytes, obytes)} за один вызов netstat."""
         res = {}
         try:
-            out = subprocess.check_output(["netstat", "-ib"], text=True)
+            # Некоторые версии macOS печатают предупреждения в stderr даже
+            # при успешном netstat. Этот stderr иначе разрывает кадр TUI.
+            out = subprocess.check_output(["netstat", "-ib"], text=True,
+                                          stderr=subprocess.DEVNULL)
         except Exception:
             return res
         for line in out.splitlines():
@@ -345,16 +375,22 @@ def main():
     signal.signal(signal.SIGINT, restore)
     signal.signal(signal.SIGTERM, restore)
 
-    sys.stdout.write("\033[?25l\033[2J")
+    sys.stdout.write("\033[?25l\033[2J\033[H")
     while True:
         cols, lines = shutil.get_terminal_size()
         body = build_frame(a, datetime.now(), metrics)
+        # Не даём кадру выйти за нижнюю границу: перенос на нижней строке
+        # прокручивает терминал и оставляет артефакты после изменения размера.
+        body = body[:max(lines, 0)]
         pad_t = max((lines - len(body)) // 2, 0)
-        buf = ["\033[H", "\n" * pad_t]
-        for l in body:
+        # LF сам по себе не обязан возвращать курсор в первый столбец.
+        buf = ["\033[H\033[J", "\r\n" * pad_t]
+        for i, l in enumerate(body):
             pad_l = max((cols - vlen(l)) // 2, 0)
-            buf.append(" " * pad_l + l + "\033[K\n")
-        buf.append("\033[J")
+            buf.append(" " * pad_l + clip_ansi(l, cols) + "\033[K")
+            # После последней строки не нужен перенос: он может сделать scroll.
+            if i + 1 < len(body):
+                buf.append("\r\n")
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
         time.sleep(0.2)
